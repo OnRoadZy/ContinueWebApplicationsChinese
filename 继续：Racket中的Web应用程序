@@ -1,0 +1,1781 @@
+继续：Racket中的Web应用程序
+
+由Danny Yoo <doo@hashcollision.org>
+和Jay McCarthy <jay@racket-lang.org>
+
+	我们如何编写动态Web应用程序？ 在本教程中，我们将展示如何使用Racket实现这一目标。 我们解释如何启动Web服务器，如何生成动态Web内容，以及如何与用户交互。 我们的工作示例将是一个简单的网络日记——一个“博客”。 
+	本教程面向那些已阅读并足够掌握《如何设计程序》的学生，以了解如何使用结构，高阶函数和一点点变动。
+
+1入门
+	本教程中所需的一切都在Racket中提供; 我们将使用DrRacket模块语言。
+	在DrRacket的Definitions窗口中输入以下内容，然后按Run按钮。
+#lang web-server/insta
+(define (start request)
+  (response/xexpr
+   '(html
+     (head (title "My Blog"))
+     (body (h1 "Under construction")))))
+	如果网络浏览器出现“正在建设”页面，那么请高兴地拍手，因为您已经构建了第一个网络应用程序！ 我们还没有做到这一点，但我们会到那里。 现在，按停止按钮关闭服务器。
+
+2应用程序
+	我们希望通过向您展示如何开发博客来讲授本教程。 博客的用户应该能够创建新帖子并向现有帖子添加评论。 我们将迭代地接近任务，指出沿途的一两个陷阱。 计划大致如下： 
+    • 显示帖子的静态列表。
+    • 允许用户向系统添加新帖子。
+    • 扩展模型以允许用户向帖子添加注释。
+    • 允许所有用户共享同一组帖子。
+    • 将我们的数据结构序列化到磁盘。
+	到本教程结束时，我们将有一个简单的博客应用程序启动并运行。
+
+3基本博客
+	我们首先定义必要的数据结构。 帖子是：
+    (struct post (title body))
+    (struct post (title body))
+ 	title : string?
+	body : string?
+练习：
+	举几个帖子的例子。
+	接下来，我们通过一个帖子列表定义一个博客：
+blog : (listof post?)
+	这里，是一个非常简单的博客示例：
+(define BLOG (list (post "First Post!"
+                         "Hey, this is my first post!")))
+	现在让我们的Web应用程序显示它。
+
+4渲染HTML
+	当Web浏览器访问我们的博客的URL时，浏览器构造一个请求结构并通过网络发送到我们的应用程序。 我们需要一个函数，我们称之为start，来消费这些请求并产生响应。 一个基本的响应是显示一个HTML页面; 这是通过函数response / xexpr来完成的，它接受一个代表所需HTML的X表达式。 X表达式定义为：
+(define xexpr/c
+  (flat-rec-contract
+   xexpr
+   (or/c string?
+         (cons/c symbol? (listof xexpr))
+         (cons/c symbol?
+                 (cons/c (listof (list/c symbol? string?))
+                         (listof xexpr))))))
+	以下示例说明使用X表达式表示HTML是多么自然。
+	xexpr / c中的第一个选择是string?。 例如，HTML 的hello表示为“hello”。 为了保证有效的HTML，字符串在输出时会自动转义。 因此，X表达式"<b>Unfinished tag"被呈现为HTML &lt;b&gt;Unfinished tag，而不是作为<b>Unfinished tag。类似地，"<i>Finished\ntag</i>"被呈现为&lt;i&gt;Finished tag&lt;/i&gt;，而不是作为<i>Finished tag</i>。
+	xexpr / c中的第二个选择是递归合同 (cons/c symbol? (listof xexpr))。 例如，HTML  <p>This is an example</p>由X表达式表示为：
+'(p "This is an example").
+	最后，xexpr / c中的第三个选项允许HTML标签中的参数。 例如，<a href="link.html">Past</a>表示为：
+'(a ((href "link.html")) "Past")
+以及<p>This is <div class="emph">another</div> example.</p> 表示为：
+'(p "This is " (div ((class "emph")) "another") " example.").
+	我们也可以使用cons和list来“手动”生成这些X表达式，但是可以得到很强大的表现形式。 例如，以下Racket表达式都计算为相同的X表达式：
+    (list 'html (list 'head (list 'title "Some title"))
+           (list 'body (list 'p "This is a simple static page.")))
+
+    '(html (head (title "Some title"))
+           (body (p "This is a simple static page.")))
+	但是后者更容易阅读和输入，因为它使用前导引号来简洁地表示列表结构。这就是如何使用aplomb构造静态html响应！（有关扩展列表缩写形式的更多信息，请参阅《如何设计程序》的第13节）。
+	然而，事实证明，这种简单的列表缩写不能产生动态的web内容。如果我们试图将表达式注入到由简单列表缩写构造的X表达式中，那些表达式将被视为列表结构的一部分，字面上！我们需要的是一个符号，给出了引用列表缩写的方便性，但是这也允许我们将列表结构的部分视为正常表达式。也就是说，我们想定义一个模板，它的占位符可以很容易地表达并动态填充。
+	Racket以称为quasiquote的符号的形式提供了这种模板功能。在排序中，列表缩写不是前导引用，而是带有反向引号（`）。如果我们希望这个反引号的列表的任何子表达式被正常地计算（“未引用”），那么我们所要做的就是在该子表达式前面放置一个逗号（,）。例如：
+; render-greeting: string -> response
+; Consumes a name, and produces a dynamic response.
+(define (render-greeting a-name)
+  (response/xexpr
+   `(html (head (title "Welcome"))
+          (body (p ,(string-append "Hello " a-name))))))
+
+练习：
+	编写一个函数，它使用一个帖子并生成一个表示该内容的X表达式。
+render-post : (post? . -> . xexpr/c)
+	例如，我们想要：
+    (render-post (post "First post!" "This is a first post."))
+得出：
+    '(div ((class "post")) "First post!" (p "This is a first post."))
+
+	我们有时想要将X表达式的列表嵌入到另一个充当模板的列表中。 例如，给定X表达式的列表 '((li "Larry") (li "Curly") (li "Moe"))，我们可能想创建单个X表达式
+'(ul (li "Larry")
+     (li "Curly")
+     (li "Moe"))
+	这不能使用纯引号，因为在'((li "Larry") (li "Curly") (li "Moe")) 前放置一个逗号将引用整个列表，产生格式不正确的表达式 '(ul ((li "Larry") (li "Curly") (li "Moe")))。
+	相反，我们必须拼接列表，如下：`(ul ,@'((li "Larry") (li "Curly") (li "Moe")))。  unquote-splicing形式，@表达式，允许我们方便地将X表达式片段列表拼接到更大的模板列表中。 为了概括示例，这里有两个帮助函数将任何X表达式列表转换为一个表示无序，逐项HTML列表的X表达式：
+; render-as-itemized-list: (listof xexpr) -> xexpr
+; Consumes a list of items, and produces a rendering
+; as an unordered list.
+(define (render-as-itemized-list fragments)
+  `(ul ,@(map render-as-item fragments)))
+ 
+; render-as-item: xexpr -> xexpr
+; Consumes an xexpr, and produces a rendering
+; as a list item.
+(define (render-as-item a-fragment)
+  `(li ,a-fragment))
+练习： 
+	编写一个函数render-posts，它使用一个（post的列表？）并为该内容生成一个X表达式。
+
+render-posts : ((listof post?) . -> . xexpr/c)
+例如，
+(render-posts empty)
+应该产生 
+‘(div((class“posts”)))
+和 
+（render-posts（list（post“Post 1”“Body 1”）
+ （post“Post 2”“Body 2”）））
+应该产生 
+'（div（（class“posts”）） 
+（div（（class“post”））“Post 1”（p“Body 1”）） 
+（div（（“post”）））“Post 2”（p“Body 2”）））
+	现在我们有了render-posts函数，让我们重新访问我们的web应用程序，并改变我们的start函数返回一个有趣的响应。
+#lang web-server/insta
+ 
+; A blog is a (listof post)
+; and a post is a (post title body)
+(struct post (title body))
+ 
+; BLOG: blog
+; The static blog.
+(define BLOG
+  (list (post "Second Post" "This is another post")
+        (post "First Post" "This is my first post")))
+ 
+; start: request -> response
+; Consumes a request, and produces a page that displays all of the
+; web content.
+(define (start request)
+  (render-blog-page BLOG request))
+ 
+; render-blog-page: blog request -> response
+; Consumes a blog and a request, and produces an HTML page
+; of the content of the blog.
+(define (render-blog-page a-blog request)
+  (response/xexpr
+   `(html (head (title "My Blog"))
+          (body (h1 "My Blog")
+                ,(render-posts a-blog)))))
+ 
+; render-post: post -> xexpr
+; Consumes a post, produces an xexpr fragment of the post.
+(define (render-post a-post)
+  `(div ((class "post"))
+        ,(post-title a-post)
+        (p ,(post-body a-post))))
+ 
+; render-posts: blog -> xexpr
+; Consumes a blog, produces an xexpr fragment
+; of all its posts.
+(define (render-posts a-blog)
+  `(div ((class "posts"))
+        ,@(map render-post a-blog)))
+	如果我们点击Run运行，我们应该在您的Web浏览器中看到博客帖子。
+
+5检查请求
+	我们的应用程序仍然有点太静态：我们动态构建页面，但我们还没有为用户提供一种方法来创建新帖子。 让我们现在通过提供一个表单，让用户添加一个新的博客条目。 当用户按下提交按钮时，我们希望新的帖子出现在页面的顶部。
+	我们还没有对我们传递的请求对象做任何事情。 正如你可能已经猜到的，它不是真的应该被忽略这么多！ 当用户填写一个Web表单并提交它时，用户的浏览器使用request-bindings函数构造一个包含表单值的新请求，我们可以在我们的末尾提取它：
+request-bindings : (request? . -> . bindings?)
+	要从一组绑定中提取单个Web表单值，Racket提供了函数extract-binding / single，它还获取Web表单的相应字段的名称：
+extract-binding/single : (symbol? bindings? . -> . string?)
+	要验证一组绑定是否包含特定字段，请使用exists-binding?: 
+ exists-binding? : (symbol? bindings? . -> . boolean?)
+	通过这些功能，我们可以设计消费请求并有效响应的函数。
+练习：
+	写一个函数can-parse-post？ 它消耗一组绑定。 它应该产生#t如果存在绑定的符号的标题和身体，否则#f。 
+ can-parse-post? : (bindings? . -> . boolean?)
+练习：
+	编写一个消耗一组绑定的函数parse-post。 假设绑定结构具有符号标题和主体的值，则解析后应生成包含这些值的帖子。
+parse-post : (bindings? . -> . post?)
+	现在我们有了这些帮助函数，我们可以扩展我们的Web应用程序来处理表单输入。 我们将在网页底部添加一个小表单，我们将调整我们的程序以处理添加新帖子。 所以我们的新的start方法将检查请求有一个可解析的帖子，然后将尝试扩展的帖子集，并将最终显示新的一组博客帖子：
+#lang web-server/insta
+ 
+; A blog is a (listof post)
+; and a post is a (post title body)
+(struct post (title body))
+ 
+; BLOG: blog
+; The static blog.
+(define BLOG
+  (list (post "Second Post" "This is another post")
+        (post "First Post" "This is my first post")))
+ 
+; start: request -> response
+; Consumes a request and produces a page that displays all of the
+; web content.
+(define (start request)
+  (define a-blog
+    (cond [(can-parse-post? (request-bindings request))
+           (cons (parse-post (request-bindings request))
+                 BLOG)]
+          [else
+           BLOG]))
+  (render-blog-page a-blog request))
+  
+; can-parse-post?: bindings -> boolean
+; Produces true if bindings contains values for 'title and 'body.
+(define (can-parse-post? bindings)
+  (and (exists-binding? 'title bindings)
+       (exists-binding? 'body bindings)))
+ 
+; parse-post: bindings -> post
+; Consumes a bindings, and produces a post out of the bindings.
+(define (parse-post bindings)
+  (post (extract-binding/single 'title bindings)
+        (extract-binding/single 'body bindings)))
+; render-blog-page: blog request -> response
+; Consumes a blog and a request, and produces an HTML page
+; of the content of the blog.
+(define (render-blog-page a-blog request)
+  (response/xexpr
+   `(html (head (title "My Blog"))
+          (body
+           (h1 "My Blog")
+           ,(render-posts a-blog)
+           (form
+            (input ((name "title")))
+            (input ((name "body")))
+            (input ((type "submit"))))))))
+ 
+; render-post: post -> xexpr
+; Consumes a post, produces an xexpr fragment of the post.
+(define (render-post a-post)
+  `(div ((class "post"))
+        ,(post-title a-post)
+        (p ,(post-body a-post))))
+ 
+; render-posts: blog -> xexpr
+; Consumes a blog, produces an xexpr fragment
+; of all its posts.
+(define (render-posts a-blog)
+  `(div ((class "posts"))
+        ,@(map render-post a-blog)))
+	这个解决方案似乎能够工作，但它有一个缺陷！ 尝试添加两个新帖子。 发生了什么？
+
+6高级控制流程
+	目前，我们毫无疑问忽略了一个巨大的问题，博客只接受一个新的博客条目。别担心，我们会解决这个问题！
+	现在更紧迫的问题是更高层次的问题：虽然我们有一个功能，开始，响应针对我们的应用程序的URL的请求，该功能已经开始承担太多的责任。特别是，现在开始处理两种不同类型的请求：用于显示博客的请求和用于添加新博客帖子的请求。它已经成为一种交通警察——一个调度员——对于我们的所有Web应用程序的行为，包括我们可能想添加的任何新功能。如果不同类型的请求被自动地指向不同的功能，则进程将更容易开始（对于我们来说）。在Racket里这可能实现吗？
+	是的！Web服务器库提供了一个函数send / suspend / dispatch，它允许我们创建一些URL，将指向它们的请求引导到我们应用程序中的特定功能。我们用一个令人眩晕的例子展示。在一个新文件中，在DrRacket的Definitions窗口中输入以下内容。
+#lang web-server/insta
+; start: request -> response
+(define (start request)
+  (phase-1 request))
+ 
+; phase-1: request -> response
+(define (phase-1 request)
+  (define (response-generator embed/url)
+    (response/xexpr
+     `(html
+       (body (h1 "Phase 1")
+             (a ((href ,(embed/url phase-2)))
+                "click me!")))))
+  (send/suspend/dispatch response-generator))
+ 
+; phase-2: request -> response
+(define (phase-2 request)
+  (define (response-generator embed/url)
+    (response/xexpr
+     `(html
+       (body (h1 "Phase 2")
+             (a ((href ,(embed/url phase-1)))
+                "click me!")))))
+  (send/suspend/dispatch response-generator))
+	这是一个循环又一个循环运行的Web应用程序。当用户首次访问应用程序时，用户在阶段1开始。生成的页面有一个超链接，当点击时，继续进入阶段2。用户可以点击回来，并回到阶段1，并且循环重复。
+	让我们更仔细地看看send / suspend / dispatch机制。 send / suspend / dispatch消耗一个响应生成函数，并给它另一个函数，称为embed / url，我们将用它来构建特殊的URL。这些URL是什么特别的：当web浏览器访问其中一个时，我们的web应用程序重新启动，而不是从开始，而是从我们与URL关联的处理程序。在处理程序阶段-1中，使用embed / url将链接与处理程序阶段2相关联，反之亦然。
+	我们可以更复杂地处理与embed / url相关的处理程序。因为处理程序只是一个请求消耗的函数，它可以在本地定义，所以可以看到其定义范围内的所有其他变量。这里是另一个循环的例子：
+#lang web-server/insta
+; start: request -> response
+(define (start request)
+  (show-counter 0 request))
+ 
+; show-counter: number request -> doesn't return
+; Displays a number that's hyperlinked: when the link is pressed,
+; returns a new page with the incremented number.
+(define (show-counter n request)
+  (define (response-generator embed/url)
+    (response/xexpr
+     `(html (head (title "Counting example"))
+            (body
+             (a ((href ,(embed/url next-number-handler)))
+                ,(number->string n))))))
+ 
+  (define (next-number-handler request)
+    (show-counter (+ n 1) request))
+  (send/suspend/dispatch response-generator))
+	此示例显示，我们可以累积交互的结果。 即使用户通过访问和查看零开始，由下一个号码处理程序产生的处理程序继续交互，累积更大和更大的数。
+	我们现在要进入循环，让我们继续前进，并返回我们的博客应用程序。 我们将调整表单的操作，以便将提交请求定向到与单独的处理程序（称为插入后处理程序）相关联的URL。
+#lang web-server/insta
+ 
+; A blog is a (listof post)
+; and a post is a (post title body)
+(struct post (title body))
+ 
+; BLOG: blog
+; The static blog.
+(define BLOG
+  (list (post "Second Post" "This is another post")
+        (post "First Post" "This is my first post")))
+ 
+; start: request -> doesn't return
+; Consumes a request and produces a page that displays all of the
+; web content.
+(define (start request)
+  (render-blog-page BLOG request))
+ 
+; parse-post: bindings -> post
+; Extracts a post out of the bindings.
+(define (parse-post bindings)
+  (post (extract-binding/single 'title bindings)
+        (extract-binding/single 'body bindings)))
+ ; render-blog-page: blog request -> doesn't return
+; Consumes a blog and a request, and produces an HTML page
+; of the content of the blog.
+(define (render-blog-page a-blog request)
+  (define (response-generator embed/url)
+    (response/xexpr
+     `(html (head (title "My Blog"))
+            (body
+             (h1 "My Blog")
+             ,(render-posts a-blog)
+             (form ((action
+                     ,(embed/url insert-post-handler)))
+                   (input ((name "title")))
+                   (input ((name "body")))
+                   (input ((type "submit"))))))))
+ 
+  (define (insert-post-handler request)
+    (render-blog-page
+     (cons (parse-post (request-bindings request))
+           a-blog)
+     request))
+  (send/suspend/dispatch response-generator))
+ 
+; render-post: post -> xexpr
+; Consumes a post, produces an xexpr fragment of the post.
+(define (render-post a-post)
+  `(div ((class "post"))
+        ,(post-title a-post)
+        (p ,(post-body a-post))))
+ 
+; render-posts: blog -> xexpr
+; Consumes a blog, produces an xexpr fragment
+; of all its posts.
+(define (render-posts a-blog)
+  `(div ((class "posts"))
+        ,@(map render-post a-blog)))
+	请注意，render-blog-page函数的结构与上一个show-counter示例的结构非常相似。 用户最后可以在博客中添加和查看多个帖子。
+	不幸的是，我们的设计仍然遇到一个问题，这可以通过添加一些帖子到系统，然后在新的浏览器窗口中访问Web应用程序的URL。 当你尝试这样做会发生什么？
+
+7共享和分享Alike
+	我们的应用程序的问题是每个浏览器窗口跟踪其自己不同的博客。 对于大多数人来说，这违背了博客的目的，即与他人分享！ 当我们插入新帖子时，而不是创建新的博客值，我们想修改博客。 换句话说，我们想做一个结构性的改变。 （《如何设计程序》第41章）。 所以让我们从BLOG绑定切换到一个列表，而不是绑定到一个可变的结构。 如果我们只是使用一个结构，我们会写如下： 
+ (struct blog (posts))
+	但是，默认情况下，Racket中的结构是不可变的。 要获得对结构变量的访问，我们需要通过在我们的一些结构定义中添加 #:mutable关键字来覆盖这个默认值。 特别是，如果我们要允许更改博客，我们必须将博客结构的定义更改为以下内容：
+	(struct blog (posts) #:mutable)
+	(struct blog (posts))
+ 帖子：
+	 (listof post?)
+	可变结构提供改变其字段的功能; 在这种情况下，我们提供了结构mutator set-blog-posts !，它允许我们更改博客的帖子：
+set-blog-posts! : (blog? (listof post?) . -> . void)
+
+练习： 
+	写一个函数blog-insert-post！ 
+ blog-insert-post! : (blog? post? . -> . void)
+	其预期的副作用是扩展博客的帖子。
+	我们现在必须修改Web应用程序以使用我们的博客的新数据表示。 由于博客现在被全局变量BLOG引用，它不再需要作为参数传递给像render-blog-page这样的处理程序。 这里是我们更新的Web应用程序，调整后，包含insert-blog-post !,和一些变量清理后：
+#lang web-server/insta
+ 
+; A blog is a (blog posts)
+; where posts is a (listof post)
+(struct blog (posts) #:mutable)
+ 
+; and post is a (post title body)
+; where title is a string, and body is a string
+(struct post (title body))
+ 
+; BLOG: blog
+; The initial BLOG.
+(define BLOG
+  (blog
+   (list (post "Second Post" "This is another post")
+         (post "First Post" "This is my first post"))))
+ 
+; blog-insert-post!: blog post -> void
+; Consumes a blog and a post, adds the post at the top of the blog.
+(define (blog-insert-post! a-blog a-post)
+  (set-blog-posts! a-blog
+                   (cons a-post (blog-posts a-blog))))
+ 
+; start: request -> doesn't return
+; Consumes a request and produces a page that displays
+; all of the web content.
+(define (start request)
+  (render-blog-page request))
+ 
+; parse-post: bindings -> post
+; Extracts a post out of the bindings.
+(define (parse-post bindings)
+  (post (extract-binding/single 'title bindings)
+        (extract-binding/single 'body bindings)))
+; render-blog-page: request -> doesn't return
+; Produces an HTML page of the content of the BLOG.
+(define (render-blog-page request)
+  (define (response-generator embed/url)
+    (response/xexpr
+     `(html (head (title "My Blog"))
+            (body
+             (h1 "My Blog")
+             ,(render-posts)
+             (form ((action
+                     ,(embed/url insert-post-handler)))
+                   (input ((name "title")))
+                   (input ((name "body")))
+                   (input ((type "submit"))))))))
+ 
+  (define (insert-post-handler request)
+    (blog-insert-post!
+     BLOG (parse-post (request-bindings request)))
+    (render-blog-page request))
+ 
+  (send/suspend/dispatch response-generator))
+ 
+; render-post: post -> xexpr
+; Consumes a post, produces an xexpr fragment of the post.
+(define (render-post a-post)
+  `(div ((class "post"))
+        ,(post-title a-post)
+        (p ,(post-body a-post))))
+; render-posts: -> xexpr
+; Consumes a blog, produces an xexpr fragment
+; of all its posts.
+(define (render-posts)
+  `(div ((class "posts"))
+        ,@(map render-post (blog-posts BLOG))))
+	现在从两个单独的浏览器窗口访问博客，并添加每个人的帖子。 你会很高兴看到这两个窗口共享同一个博客！
+
+8扩展模型
+	接下来，让我们扩展应用程序，以便一个帖子可以包含一个注释列表。 数据定义变为： 
+struct
+ (struct	post (title body comments)
+        #:mutable)
+      title : string?
+      body : string?
+      comments : (listof string?)
+练习：
+	为帖子写入更新的数据结构定义。 确保使结构可变，因为我们打算向帖子添加注释。
+练习： 
+	组织一些帖子的例子。
+练习：
+	 定义一个函数post-insert-comment！ 
+  post-insert-comment! : (post? string? . -> . void)
+	其意图副作用是在帖子的评论列表的末尾添加新的评论。
+练习： 
+	调整render-post，以便生成的片段将在逐项列表中包含注释。
+练习：
+	因为我们已经将帖子扩展为包含注释，所以您还需要调整应用程序的其他操作后部分，例如使用帖子。
+	现在我们已经调整了函数以适应post的新结构，我们的web应用程序应该是可运行的。 用户甚至可以看到我们的劳动的一些成果：如果初始BLOG具有带评论的帖子，用户现在应该看到它们。 另一方面，显然丢失了一些东西：用户没有通过其添加注释的接口！
+
+9拆分显示
+	我们应如何将评论更全面地纳入用户的网络体验？ 
+	看到一个页面上的所有帖子和评论可能有点压倒性，所以也许我们应该阻止在主博客页面上显示评论。 相反，让我们做一个次要的“细节”视图的一个位置，并在其中提出其意见。 因此，博客的顶级视图将仅显示帖子的标题和主体以及其评论的数量。
+	所以现在我们需要一种方式来访问帖子的详细信息页面。 一种方法是超链接帖子的标题：如果希望查看帖子的详细信息页面，则只需要点击帖子的标题。 在该帖子的详细信息页面中，我们甚至可以添加一个表单，让用户添加新的评论。 此新版本的Web应用程序的页面流简单描述如下：
+
+	此图中的每个节点（气泡）对应于请求消耗处理程序。 正如你可能期望的，我们将使用send / suspend / dispatch一些。 图中的每个箭头都将被实现为我们使用embed / url生成的URL。
+	这种方法有一个稍微混乱的后果。 以前，我们渲染了没有任何超链接的帖子列表。 但是由于生成特殊调度URL的任何函数都必须使用embed / url这样做，所以我们需要调整render-posts和render-post来使用，并在使用embed / url本身时创建这些超级链接的标题。
+	我们现在有一个非常复杂的Web应用程序，允许创建帖子和添加注释。 这是它的外观：
+#lang web-server/insta
+ 
+; A blog is a (blog posts)
+; where posts is a (listof post)
+(struct blog (posts) #:mutable)
+ 
+; and post is a (post title body comments)
+; where title is a string, body is a string,
+; and comments is a (listof string)
+(struct post (title body comments) #:mutable)
+ 
+; BLOG: blog
+; The initial BLOG.
+(define BLOG
+  (blog
+   (list (post "Second Post"
+               "This is another post"
+               (list))
+         (post "First Post"
+               "This is my first post"
+               (list "First comment!")))))
+ 
+; blog-insert-post!: blog post -> void
+; Consumes a blog and a post, adds the post at the top of the blog.
+(define (blog-insert-post! a-blog a-post)
+  (set-blog-posts! a-blog
+                   (cons a-post (blog-posts a-blog))))
+ ; post-insert-comment!: post string -> void
+; Consumes a post and a comment string.  As a side-efect, 
+; adds the comment to the bottom of the post's list of comments.
+(define (post-insert-comment! a-post a-comment)
+  (set-post-comments!
+   a-post
+   (append (post-comments a-post) (list a-comment))))
+ 
+; start: request -> doesn't return
+; Consumes a request, and produces a page that displays
+; all of the web content.
+(define (start request)
+  (render-blog-page request))
+ 
+; render-blog-page: request -> doesn't return
+; Produces an HTML page of the content of the
+; BLOG.
+(define (render-blog-page request)
+  (define (response-generator embed/url)
+    (response/xexpr
+     `(html (head (title "My Blog"))
+            (body
+             (h1 "My Blog")
+             ,(render-posts embed/url)
+             (form ((action
+                     ,(embed/url insert-post-handler)))
+                   (input ((name "title")))
+                   (input ((name "body")))
+                   (input ((type "submit"))))))))
+  ; parse-post: bindings -> post
+  ; Extracts a post out of the bindings.
+  (define (parse-post bindings)
+    (post (extract-binding/single 'title bindings)
+          (extract-binding/single 'body bindings)
+          (list)))
+ 
+  (define (insert-post-handler request)
+    (blog-insert-post!
+     BLOG (parse-post (request-bindings request)))
+    (render-blog-page request))
+  (send/suspend/dispatch response-generator))
+ 
+; render-post-detail-page: post request -> doesn't return
+; Consumes a post and request, and produces a detail page
+; of the post. The user will be able to insert new comments.
+(define (render-post-detail-page a-post request)
+  (define (response-generator embed/url)
+    (response/xexpr
+     `(html (head (title "Post Details"))
+            (body
+             (h1 "Post Details")
+             (h2 ,(post-title a-post))
+             (p ,(post-body a-post))
+             ,(render-as-itemized-list
+               (post-comments a-post))
+             (form ((action
+                     ,(embed/url insert-comment-handler)))
+                   (input ((name "comment")))
+                   (input ((type "submit"))))))))
+ 
+  (define (parse-comment bindings)
+    (extract-binding/single 'comment bindings))
+  (define (insert-comment-handler a-request)
+    (post-insert-comment!
+     a-post (parse-comment (request-bindings a-request)))
+    (render-post-detail-page a-post a-request))
+  (send/suspend/dispatch response-generator))
+  
+; render-post: post (handler -> string) -> xexpr
+; Consumes a post, produces an xexpr fragment of the post.
+; The fragment contains a link to show a detailed view of the post.
+(define (render-post a-post embed/url)
+  (define (view-post-handler request)
+    (render-post-detail-page a-post request))
+  `(div ((class "post"))
+        (a ((href ,(embed/url view-post-handler)))
+           ,(post-title a-post))
+        (p ,(post-body a-post))
+        (div ,(number->string (length (post-comments a-post)))
+             " comment(s)")))
+ 
+; render-posts: (handler -> string) -> xexpr
+; Consumes a embed/url, and produces an xexpr fragment
+; of all its posts.
+(define (render-posts embed/url)
+  (define (render-post/embed/url a-post)
+    (render-post a-post embed/url))
+  `(div ((class "posts"))
+        ,@(map render-post/embed/url (blog-posts BLOG))))
+ 
+; render-as-itemized-list: (listof xexpr) -> xexpr
+; Consumes a list of items, and produces a rendering as
+; an unorderered list.
+(define (render-as-itemized-list fragments)
+  `(ul ,@(map render-as-item fragments)))
+; render-as-item: xexpr -> xexpr
+; Consumes an xexpr, and produces a rendering
+; as a list item.
+(define (render-as-item a-fragment)
+  `(li ,a-fragment))
+	但它仍然有一个问题：一旦在后详细页面，用户返回博客的唯一方法是使用后退按钮！ 这是破坏性的，它可能允许用户“卡住”在Web应用程序的黑暗角落。 为了解决这个问题，让我们改进页面流。
+
+10添加后退按钮
+
+	也许我们应该从render-post-detail-page中添加一个BACK链接，它返回我们到顶级博客。 这是相应的页面流程图：
+
+练习：
+	调整render-post-detail-page以包括回到render-blog-page的另一个链接。
+	并且由于用户可能对评论有改变的心，让我们丰富流程，以给用户提供退出提交的机会。
+
+	请注意，虽然这种变化可能看起来很复杂，但它不会影响我们的处理程序的一般形态：
+#lang web-server/insta
+ 
+; A blog is a (blog posts)
+; where posts is a (listof post)
+(struct blog (posts) #:mutable)
+ 
+; and post is a (post title body comments)
+; where title is a string, body is a string,
+; and comments is a (listof string)
+(struct post (title body comments) #:mutable)
+ 
+; BLOG: blog
+; The initial BLOG.
+(define BLOG
+  (blog
+   (list (post "Second Post"
+               "This is another post"
+               (list))
+         (post "First Post"
+               "This is my first post"
+               (list "First comment!")))))
+ 
+; blog-insert-post!: blog post -> void
+; Consumes a blog and a post, adds the post at the top of the blog.
+(define (blog-insert-post! a-blog a-post)
+  (set-blog-posts! a-blog
+                   (cons a-post (blog-posts a-blog))))
+  
+; post-insert-comment!: post string -> void
+; Consumes a post and a comment string.  As a side-efect, 
+; adds the comment to the bottom of the post's list of comments.
+(define (post-insert-comment! a-post a-comment)
+  (set-post-comments!
+   a-post
+   (append (post-comments a-post) (list a-comment))))
+; start: request -> doesn't return
+; Consumes a request and produces a page that displays
+; all of the web content.
+(define (start request)
+  (render-blog-page request))
+ 
+; render-blog-page: request -> doesn't return
+; Produces an HTML page of the content of the
+; BLOG.
+(define (render-blog-page request)
+  (define (response-generator embed/url)
+    (response/xexpr
+     `(html (head (title "My Blog"))
+            (body
+             (h1 "My Blog")
+             ,(render-posts embed/url)
+             (form ((action
+                     ,(embed/url insert-post-handler)))
+                   (input ((name "title")))
+                   (input ((name "body")))
+                   (input ((type "submit"))))))))
+ 
+  ; parse-post: bindings -> post
+  ; Extracts a post out of the bindings.
+  (define (parse-post bindings)
+    (post (extract-binding/single 'title bindings)
+          (extract-binding/single 'body bindings)
+          (list)))
+ 
+  (define (insert-post-handler request)
+    (blog-insert-post!
+     BLOG (parse-post (request-bindings request)))
+    (render-blog-page request))
+  (send/suspend/dispatch response-generator))
+; render-post-detail-page: post request -> doesn't return
+; Consumes a post and produces a detail page of the post.
+; The user will be able to either insert new comments
+; or go back to render-blog-page.
+(define (render-post-detail-page a-post request)
+  (define (response-generator embed/url)
+    (response/xexpr
+     `(html (head (title "Post Details"))
+            (body
+             (h1 "Post Details")
+             (h2 ,(post-title a-post))
+             (p ,(post-body a-post))
+             ,(render-as-itemized-list
+               (post-comments a-post))
+             (form ((action
+                     ,(embed/url insert-comment-handler)))
+                   (input ((name "comment")))
+                   (input ((type "submit"))))
+             (a ((href ,(embed/url back-handler)))
+                "Back to the blog")))))
+ 
+  (define (parse-comment bindings)
+    (extract-binding/single 'comment bindings))
+ 
+  (define (insert-comment-handler request)
+    (render-confirm-add-comment-page
+     (parse-comment (request-bindings request))
+     a-post
+     request))
+ 
+  (define (back-handler request)
+    (render-blog-page request))
+  (send/suspend/dispatch response-generator))
+; render-confirm-add-comment-page :
+; comment post request -> doesn't return
+; Consumes a comment that we intend to add to a post, as well
+; as the request. If the user follows through, adds a comment 
+; and goes back to the display page. Otherwise, goes back to 
+; the detail page of the post.
+(define (render-confirm-add-comment-page a-comment a-post request)
+  (define (response-generator embed/url)
+    (response/xexpr
+     `(html (head (title "Add a Comment"))
+            (body
+             (h1 "Add a Comment")
+             "The comment: " (div (p ,a-comment))
+             "will be added to "
+             (div ,(post-title a-post))
+ 
+             (p (a ((href ,(embed/url yes-handler)))
+                   "Yes, add the comment."))
+             (p (a ((href ,(embed/url cancel-handler)))
+                   "No, I changed my mind!"))))))
+ 
+  (define (yes-handler request)
+    (post-insert-comment! a-post a-comment)
+    (render-post-detail-page a-post request))
+ 
+  (define (cancel-handler request)
+    (render-post-detail-page a-post request))
+  (send/suspend/dispatch response-generator))
+; render-post: post (handler -> string) -> xexpr
+; Consumes a post, produces an xexpr fragment of the post.
+; The fragment contains a link to show a detailed view of the post.
+(define (render-post a-post embed/url)
+  (define (view-post-handler request)
+    (render-post-detail-page a-post request))
+  `(div ((class "post"))
+        (a ((href ,(embed/url view-post-handler)))
+           ,(post-title a-post))
+        (p ,(post-body a-post))
+        (div ,(number->string (length (post-comments a-post)))
+             " comment(s)")))
+ 
+; render-posts: (handler -> string) -> xexpr
+; Consumes a embed/url, produces an xexpr fragment
+; of all its posts.
+(define (render-posts embed/url)
+  (define (render-post/embed/url a-post)
+    (render-post a-post embed/url))
+  `(div ((class "posts"))
+        ,@(map render-post/embed/url (blog-posts BLOG))))
+ 
+; render-as-itemized-list: (listof xexpr) -> xexpr
+; Consumes a list of items, and produces a rendering as
+; an unorderered list.
+(define (render-as-itemized-list fragments)
+  `(ul ,@(map render-as-item fragments)))
+ 
+; render-as-item: xexpr -> xexpr
+; Consumes an xexpr, and produces a rendering
+; as a list item.
+(define (render-as-item a-fragment)
+  `(li ,a-fragment))
+
+11布局样式！
+	我们的网络应用程序现在功能齐全。但它的视觉缺乏，所以让我们试着改善它的外观。向我们的网页添加可视化panache的一种方法是使用级联样式表。例如，如果我们想使所有段落为绿色，我们可能会在响应中插入以下样式声明。
+'(style ((type "text/css")) "p { color: green }")
+	将这样的声明直接嵌入我们的响应是诱人的。但是我们的源文件已经相当繁忙，并且作为一个原则，我们应该将逻辑表示与可视化呈现分开。因此，不是直接在HTML响应中嵌入.css，而是将链接引用添加到单独的.css文件。
+	到目前为止，我们的Web应用程序生成的所有内容都来自响应生成处理程序。但是这种动态生成的HTML对于静态内容不是必需的。这样的静态资源的示例包括图像，文档和.css文件。为了与我们的Web应用程序一起服务，我们通知Web服务器我们专门为静态文件创建的目录。函数static-files-path，
+        static-files-path : (path-string? -> void)
+	告诉Web服务器在接收到类似于静态资源请求的URL时查看给定的路径。
+练习：
+	创建一个名为“test-static.rkt”的简单Web应用程序，包含以下内容：
+#lang web-server/insta
+(define (start request)
+  (response/xexpr
+   '(html (head (title "Testing")
+                (link ((rel "stylesheet")
+                       (href "/test-static.css")
+                       (type "text/css"))))
+          (body (h1 "Testing")
+                (h2 "This is a header")
+                (p "This is " (span ((class "hot")) "hot") ".")))))
+ (static-files-path "htdocs")
+	创建一个名为“htdocs”的子目录，根目录与“test-static.rkt”源位于同一目录。 只是为了看到我们可以服务这个.css页面，在“htdocs /”中创建一个非常简单的.css文件“test-static.css”，其中包含以下内容：
+body {
+  margin-left: 10%;
+  margin-right: 10%;
+}
+
+p { font-family: sans-serif }
+
+h1 { color: green }
+
+h2 { font-size: small }
+
+span.hot { color: red }
+	现在运行应用程序并查看浏览器的输出。 网页应该出现，但它的页面仍然应该有一些颜色。
+练习：
+	通过编写适合您口味的外部样式表来改进博客Web应用程序的表示。 调整所有HTML响应处理程序以包括样式表的链接。
+
+12重复提交错误
+	我们的应用还有另一个微妙的问题。 要看到它，再次升级博客应用程序，并添加一个帖子。 然后重新加载页面， 重新加载页面。
+	你所观察到的是众所周知的“重复提交”问题。 每当用户按下重新加载，一个请求被发送到我们的应用程序，问题是一些请求使应用程序突变数据结构。
+	Web开发人员用来避免重复提交问题的常见技术是将状态突变请求重定向到不同的URL，这是一个可以重新加载的URL。 这个技巧是通过函数redirect / get在Racket中实现的：
+ redirect/get : (-> request?)
+	它的直接副作用是强制用户的浏览器跟随重定向到一个安全的URL，它给了我们新的新的请求。
+	例如，考虑一个玩具应用程序，让用户向名单添加名称：
+#lang web-server/insta
+ 
+; A roster is a (roster names)
+; where names is a list of string.
+(struct roster (names) #:mutable)
+ 
+; roster-add-name!: roster string -> void
+; Given a roster and a name, adds the name
+; to the end of the roster.
+(define (roster-add-name! a-roster a-name)
+  (set-roster-names! a-roster
+                    (append (roster-names a-roster)
+                            (list a-name))))
+ 
+(define ROSTER (roster '("kathi" "shriram" "dan")))
+ 
+; start: request -> doesn't return
+(define (start request)
+  (show-roster request))
+ 
+; show-roster: request -> doesn't return
+(define (show-roster request)
+  (define (response-generator embed/url)
+    (response/xexpr
+     `(html (head (title "Roster"))
+            (body (h1 "Roster")
+                  ,(render-as-itemized-list
+                    (roster-names ROSTER))
+                  (form ((action
+                          ,(embed/url add-name-handler)))
+                        (input ((name "a-name")))
+                        (input ((type "submit"))))))))
+  (define (parse-name bindings)
+    (extract-binding/single 'a-name bindings))
+  (define (add-name-handler request)
+    (roster-add-name!
+     ROSTER (parse-name (request-bindings request)))
+    (show-roster request))
+  (send/suspend/dispatch response-generator))
+ 
+; render-as-itemized-list: (listof xexpr) -> xexpr
+(define (render-as-itemized-list fragments)
+  `(ul ,@(map render-as-item fragments)))
+ 
+; render-as-item: xexpr -> xexpr
+(define (render-as-item a-fragment)
+  `(li ,a-fragment))
+	这个应用程序遇到了与我们的博客相同的问题：如果用户添加一个名称，然后按重新加载，则相同的名称将被添加两次。
+	我们可以通过更改单个表达式来解决这个问题; 你能找到它吗？
+#lang web-server/insta
+ 
+; A roster is a (roster names)
+; where names is a list of string.
+(struct roster (names) #:mutable)
+ 
+; roster-add-name!: roster string -> void
+; Given a roster and a name, adds the name
+; to the end of the roster.
+(define (roster-add-name! a-roster a-name)
+  (set-roster-names! a-roster
+                    (append (roster-names a-roster)
+                            (list a-name))))
+ 
+(define ROSTER (roster '("kathi" "shriram" "dan")))
+ 
+; start: request -> doesn't return
+(define (start request)
+  (show-roster request))
+ 
+; show-roster: request -> doesn't return
+(define (show-roster request)
+  (define (response-generator embed/url)
+    (response/xexpr
+     `(html (head (title "Roster"))
+            (body (h1 "Roster")
+                  ,(render-as-itemized-list
+                    (roster-names ROSTER))
+                  (form ((action
+                          ,(embed/url add-name-handler)))
+                        (input ((name "a-name")))
+                        (input ((type "submit"))))))))
+
+  (define (parse-name bindings)
+    (extract-binding/single 'a-name bindings))
+
+  (define (add-name-handler request)
+    (roster-add-name!
+     ROSTER (parse-name (request-bindings request)))
+    (show-roster (redirect/get)))
+  (send/suspend/dispatch response-generator))
+ 
+; render-as-itemized-list: (listof xexpr) -> xexpr
+(define (render-as-itemized-list fragments)
+  `(ul ,@(map render-as-item fragments)))
+ 
+; render-as-item: xexpr -> xexpr
+(define (render-as-item a-fragment)
+  `(li ,a-fragment))
+	所以double-submit错误很容易阻止：每当你有处理程序改变系统的状态，使用redirect / get发送回你的响应。行使。 使用redirect / get修复博客应用程序中的double-submit错误。有了这些小修复，我们的博客应用程序现在看起来像这样：
+; render-post: post (handler -> string) -> xexpr
+; Consumes a post, produces an xexpr fragment of the post.
+; The fragment contains a link to show a detailed view of the post.
+(define (render-post a-post embed/url)
+  (define (view-post-handler request)
+    (render-post-detail-page a-post request))
+  `(div ((class "post"))
+        (a ((href ,(embed/url view-post-handler)))
+           ,(post-title a-post))
+        (p ,(post-body a-post))
+        (div ,(number->string (length (post-comments a-post)))
+             " comment(s)")))
+ 
+; render-posts: (handler -> string) -> xexpr
+; Consumes a embed/url, produces an xexpr fragment
+; of all its posts.
+(define (render-posts embed/url)
+  (define (render-post/embed/url a-post)
+    (render-post a-post embed/url))
+  `(div ((class "posts"))
+        ,@(map render-post/embed/url (blog-posts BLOG))))
+ 
+; render-as-itemized-list: (listof xexpr) -> xexpr
+; Consumes a list of items, and produces a rendering as
+; an unorderered list.
+(define (render-as-itemized-list fragments)
+  `(ul ,@(map render-as-item fragments)))
+ 
+; render-as-item: xexpr -> xexpr
+; Consumes an xexpr, and produces a rendering
+; as a list item.
+(define (render-as-item a-fragment)
+  `(li ,a-fragment))
+
+13抽象模型
+	如果我们通过关闭程序“关闭灯”，我们的应用程序的状态消失在以太。我们如何让我们的短暂状态坚持？在我们解决这个问题之前，请注意，它不适用于所有的应用程序的状态，因为我们没有长期的兴趣像请求。我们关心的保存是我们的博客模型。
+	如果我们仔细看看我们的Web应用程序，我们看到我们的博客模型和使用该模型的Web应用程序之间的接缝。让我们分离模型;它的所有东西附近的顶部：
+(struct blog (posts) #:mutable)
+(struct post (title body comments) #:mutable)
+(define BLOG ...)
+(define (blog-insert-post! ...) ...)
+(define (post-insert-comment! ...) ...)
+	在现实的Web应用程序中，模型和Web应用程序由抽象墙分隔。在理论上，这种分离允许我们在未来做出孤立的变化而不会破坏整个系统。所以让我们开始分离。首先，我们将模型拆分成一个单独的文件，然后我们将研究使模型持久化。
+	创建一个名为“model.rkt”的新文件，包含以下内容。
+#lang racket/base
+ 
+; A blog is a (blog posts)
+; where posts is a (listof post)
+(struct blog (posts) #:mutable)
+ 
+; and post is a (post title body comments)
+; where title is a string, body is a string, 
+; and comments is a (listof string)
+(struct post (title body comments) #:mutable)
+ 
+; BLOG: blog
+; The initial BLOG.
+(define BLOG
+  (blog
+   (list (post "Second Post"
+               "This is another post"
+               (list))
+         (post "First Post"
+               "This is my first post"
+               (list "First comment!")))))
+ 
+; blog-insert-post!: blog post -> void
+; Consumes a blog and a post, adds the post at the top of the blog.
+(define (blog-insert-post! a-blog a-post)
+  (set-blog-posts!
+   a-blog
+   (cons a-post (blog-posts a-blog))))
+ 
+; post-insert-comment!: post string -> void
+; Consumes a post and a comment string.  As a side-efect, 
+; adds the comment to the bottom of the post's list of comments.
+(define (post-insert-comment! a-post a-comment)
+  (set-post-comments!
+   a-post
+   (append (post-comments a-post) (list a-comment))))
+ 
+(provide (all-defined-out))
+	这实质上是我们确定为我们的模型的线的剪切和粘贴。 它是用 racket语言编写的，因为模型不需要担心web服务器的东西。 还有一个额外的表达式，看起来有点奇怪：
+(provide (all-defined-out))
+	它告诉Racket授予其他文件访问“model.rkt”文件中定义的所有内容。
+	现在我们回到我们的web应用程序，并改变它使用这个模型，通过用表达式替换删除的模型代码 
+（require“model.rkt”）
+	它将我们的Web应用程序模块挂接到“model.rkt”模块。
+(define (insert-post-handler request)
+    (blog-insert-post!
+     BLOG (parse-post (request-bindings request)))
+    (render-blog-page (redirect/get)))
+  (send/suspend/dispatch response-generator))
+ 
+; render-post-detail-page: post request -> doesn't return
+; Consumes a post and produces a detail page of the post.
+; The user will be able to either insert new comments
+; or go back to render-blog-page.
+(define (render-post-detail-page a-post request)
+  (define (response-generator embed/url)
+    (response/xexpr
+     `(html (head (title "Post Details"))
+            (body
+             (h1 "Post Details")
+             (h2 ,(post-title a-post))
+             (p ,(post-body a-post))
+             ,(render-as-itemized-list
+               (post-comments a-post))
+             (form ((action
+                     ,(embed/url insert-comment-handler)))
+                   (input ((name "comment")))
+                   (input ((type "submit"))))
+             (a ((href ,(embed/url back-handler)))
+                "Back to the blog")))))
+ 
+  (define (parse-comment bindings)
+    (extract-binding/single 'comment bindings))
+ 
+  (define (insert-comment-handler request)
+    (render-confirm-add-comment-page
+     (parse-comment (request-bindings request))
+     a-post
+     request))
+
+14持久模型
+	现在模型驻留在一个单独的模块中，我们可以更容易地修改它，特别是可以使其持久化。	第一步是使模型结构可序列化。以前，我们通过在它们的定义中添加＃：mutable来使结构可变。类似地，当关键字＃：prefab被添加到结构的定义中时，Racket理解该结构可以是“预先制造的”，即在程序开始运行之前创建的，这正是我们在恢复博客数据时所需要的从磁盘。我们的博客结构定义现在看起来像：
+（struct blog（posts）＃：mutable＃：prefab）
+	博客结构现在可以从外部读取和写入。但是我们还需要确保博客结构中的所有内容也（传递）标记为＃：prefab。
+练习：
+	为帖子写新的结构定义。
+	在这一点上，我们可以读写博客到磁盘。所以让我们这样做。首先，我们将向模型添加一个指向博客驻留在磁盘上的路径的路径：
+    (struct	 blog (home posts)
+
+    #:mutable
+    #:prefab)
+  home : string?
+  posts : (listof post?)
+	注意，我们需要将路径转换为字符串。 为什么我们不让博客结构包含路径？ 答案：它们不能用于读写。
+练习：
+	为博客编写新的结构定义。
+	接下来我们创建一个函数，让我们的应用程序初始化博客：
+; initialize-blog! : path? -> blog
+; Reads a blog from a path, if not present, returns default
+(define (initialize-blog! home)
+  (define (log-missing-exn-handler exn)
+    (blog
+     (path->string home)
+     (list (post "First Post"
+                 "This is my first post"
+                 (list "First comment!"))
+           (post "Second Post"
+                 "This is another post"
+                 (list)))))
+  (define the-blog
+    (with-handlers ([exn? log-missing-exn-handler])
+      (with-input-from-file home read)))
+  (set-blog-home! the-blog (path->string home))
+  the-blog)
+	initialize-blog! 采取一个路径，并尝试从中读取。 如果路径包含博客结构，则读取并解析它，因为博客是 #:prefab。 如果在路径上没有文件，或者如果文件有一些虚假数据，则读取或 with-input-from-file 将抛出异常。 with-handlers提供了一个异常处理程序，通过返回默认的博客结构来响应任何错误。 在将博客绑定到新读取（或默认）结构之后，我们将home设置为正确的路径。接下来我们需要一个函数将模型保存到磁盘：
+; save-blog! : blog -> void
+; Saves the contents of a blog to its home
+(define (save-blog! a-blog)
+  (define (write-to-blog)
+    (write a-blog))
+  (with-output-to-file (blog-home a-blog)
+    write-to-blog
+    #:exists 'replace))
+	save-blog!将模型写入home; 通过提供一个 #:exists子句输出到with-output-to-file，它确保磁盘上的旧内容将被覆盖。
+	此函数现在可用于在用户修改博客结构时保存博客结构。 因为修改只是通过模型，只有blog-insert-post!  和post-insert-comment! 将需要更新。
+练习：
+	更改 blog-insert-post!  和post-insert-comment!  调用save-blog!.
+
+	你可能已经注意到一个问题，当试图更新post-insert-comment!，该函数没有博客传递到 save-blog!。 因此，我们需要给它一个博客参数，并适当地更改应用程序。 虽然我们在这里，让我们改变blog-insert-post! 接受post结构的内容，而不是结构本身。 这改进了模型的界面，使其更抽象：
+blog-insert-post! : (blog? string? string? . -> . void)
+post-insert-comment! : (blog? post? string? . -> . void)
+练习：
+	编写blog-insert-post!和 post-insert-comment!的新定义，记住调用save-blog !.
+	在模型的上一次迭代中，我们使用 (provide (all-defined-out))公开所有模型的定义。这违反了抽象的原则，它告诉我们隐藏实现细节，如私有函数和内部数据结构。我们现在将遵循这个原则，通过使用一种形式的明确地命名暴露的定义。
+	例如，如果我们想将模块的曝光限制为函数blog-insert-post!和post-insert-comment!，我们可以这样做：
+  (provide blog-insert-post!
+             post-insert-comment!)
+	但这暴露太少！因此，让我们将模型中的提供线更改为：
+    (provide blog? blog-posts
+             post? post-title post-body post-comments
+             initialize-blog!
+             blog-insert-post! post-insert-comment!)
+
+	因为这九个功能都是我们需要的模块，这种程度的曝光是正确的。
+	最后一步是更改应用程序。 我们需要调用initialize-blog! 以读取博客结构，并且，由于不再有BLOG导出，我们需要在应用程序周围传递返回的博客值。
+	首先，改变开始调用initialize-blog！ 在我们的home目录中有一个路径：
+(define (start request)
+      (render-blog-page
+       (initialize-blog!
+        (build-path (current-directory)
+                    "the-blog-data.db"))
+       request))
+练习：
+	通过应用程序线程博客结构适当地给blog-insert-post! 和 post-insert-comment! 正确的值。 您还需要更改render-blog-page如何添加新帖子。
+	我们的模型是：
+    #lang racket/base
+    (require racket/list)
+     
+    ; A blog is a (blog home posts)
+    ; where home is a string, posts is a (listof post)
+    (struct blog (home posts) #:mutable #:prefab)
+     
+    ; and post is a (post blog title body comments)
+    ; where title is a string, body is a string,
+    ; and comments is a (listof string)
+    (struct post (title body comments) #:mutable #:prefab)
+     
+    ; initialize-blog! : path? -> blog
+    ; Reads a blog from a path, if not present, returns default
+    (define (initialize-blog! home)
+      (define (log-missing-exn-handler exn)
+        (blog
+         (path->string home)
+         (list (post "Second Post"
+                     "This is another post"
+                     (list))
+               (post "First Post"
+                     "This is my first post"
+                     (list "First comment!")))))
+      (define the-blog
+        (with-handlers ([exn? log-missing-exn-handler])
+          (with-input-from-file home read)))
+      (set-blog-home! the-blog (path->string home))
+      the-blog)
+     
+    ; save-blog! : blog -> void
+    ; Saves the contents of a blog to its home
+    (define (save-blog! a-blog)
+      (define (write-to-blog)
+        (write a-blog))
+      (with-output-to-file (blog-home a-blog)
+        write-to-blog
+        #:exists 'replace))
+     
+    ; blog-insert-post!: blog string string -> void
+    ; Consumes a blog and a post, adds the post at the top of the blog.
+    (define (blog-insert-post! a-blog title body)
+      (set-blog-posts!
+       a-blog
+       (cons (post title body empty) (blog-posts a-blog)))
+      (save-blog! a-blog))
+     
+    ; post-insert-comment!: blog post string -> void
+    ; Consumes a blog, a post and a comment string.  As a side-efect, 
+    ; adds the comment to the bottom of the post's list of comments.
+    (define (post-insert-comment! a-blog a-post a-comment)
+      (set-post-comments!
+       a-post
+       (append (post-comments a-post) (list a-comment)))
+      (save-blog! a-blog))
+     
+    (provide blog? blog-posts
+             post? post-title post-body post-comments
+             initialize-blog!
+             blog-insert-post! Post-insert-comment!)
+	您的应用程序是：
+#lang web-server/insta
+ 
+(require "model-2.rkt")
+ 
+; start: request -> doesn't return
+; Consumes a request and produces a page that displays
+; all of the web content.
+(define (start request)
+  (render-blog-page
+   (initialize-blog!
+    (build-path (current-directory)
+                "the-blog-data.db"))
+   request))
+ 
+; render-blog-page: blog request -> doesn't return
+; Produces an HTML page of the content of the
+; blog.
+(define (render-blog-page a-blog request)
+  (define (response-generator embed/url)
+    (response/xexpr
+     `(html (head (title "My Blog"))
+            (body
+             (h1 "My Blog")
+             ,(render-posts a-blog embed/url)
+             (form ((action
+                     ,(embed/url insert-post-handler)))
+                   (input ((name "title")))
+                   (input ((name "body")))
+                   (input ((type "submit"))))))))
+ 
+  (define (insert-post-handler request)
+    (define bindings (request-bindings request))
+    (blog-insert-post!
+     a-blog
+     (extract-binding/single 'title bindings)
+     (extract-binding/single 'body bindings))
+    (render-blog-page a-blog (redirect/get)))
+  (send/suspend/dispatch response-generator))
+ 
+; render-post-detail-page: post request -> doesn't return
+; Consumes a post and produces a detail page of the post.
+; The user will be able to either insert new comments
+; or go back to render-blog-page.
+(define (render-post-detail-page a-blog a-post request)
+  (define (response-generator embed/url)
+    (response/xexpr
+     `(html (head (title "Post Details"))
+            (body
+             (h1 "Post Details")
+             (h2 ,(post-title a-post))
+             (p ,(post-body a-post))
+             ,(render-as-itemized-list
+               (post-comments a-post))
+             (form ((action
+                     ,(embed/url insert-comment-handler)))
+                   (input ((name "comment")))
+                   (input ((type "submit"))))
+             (a ((href ,(embed/url back-handler)))
+                "Back to the blog")))))
+ 
+  (define (parse-comment bindings)
+    (extract-binding/single 'comment bindings))
+ 
+  (define (insert-comment-handler request)
+    (render-confirm-add-comment-page
+     a-blog
+     (parse-comment (request-bindings request))
+     a-post
+     request))
+ 
+  (define (back-handler request)
+    (render-blog-page a-blog request))
+  (send/suspend/dispatch response-generator))
+ 
+; render-confirm-add-comment-page :
+; blog comment post request -> doesn't return
+; Consumes a comment that we intend to add to a post, as well
+; as the request. If the user follows through, adds a comment 
+; and goes back to the display page. Otherwise, goes back to 
+; the detail page of the post.
+(define (render-confirm-add-comment-page a-blog a-comment
+                                         a-post request)
+  (define (response-generator embed/url)
+    (response/xexpr
+     `(html (head (title "Add a Comment"))
+            (body
+             (h1 "Add a Comment")
+             "The comment: " (div (p ,a-comment))
+             "will be added to "
+             (div ,(post-title a-post))
+ 
+             (p (a ((href ,(embed/url yes-handler)))
+                   "Yes, add the comment."))
+             (p (a ((href ,(embed/url cancel-handler)))
+                   "No, I changed my mind!"))))))
+ 
+  (define (yes-handler request)
+    (post-insert-comment! a-blog a-post a-comment)
+    (render-post-detail-page a-blog a-post (redirect/get)))
+ 
+  (define (cancel-handler request)
+    (render-post-detail-page a-blog a-post request))
+  (send/suspend/dispatch response-generator))
+ 
+; render-post: post (handler -> string) -> xexpr
+; Consumes a post, produces an xexpr fragment of the post.
+; The fragment contains a link to show a detailed view of the post.
+(define (render-post a-blog a-post embed/url)
+  (define (view-post-handler request)
+    (render-post-detail-page a-blog a-post request))
+  `(div ((class "post"))
+        (a ((href ,(embed/url view-post-handler)))
+           ,(post-title a-post))
+        (p ,(post-body a-post))
+        (div ,(number->string (length (post-comments a-post)))
+             " comment(s)")))
+ 
+; render-posts: blog (handler -> string) -> xexpr
+; Consumes a embed/url, produces an xexpr fragment
+; of all its posts.
+(define (render-posts a-blog embed/url)
+  (define (render-post/embed/url a-post)
+    (render-post a-blog a-post embed/url))
+  `(div ((class "posts"))
+        ,@(map render-post/embed/url (blog-posts a-blog))))
+ 
+; render-as-itemized-list: (listof xexpr) -> xexpr
+; Consumes a list of items, and produces a rendering as
+; an unorderered list.
+(define (render-as-itemized-list fragments)
+  `(ul ,@(map render-as-item fragments)))
+ 
+; render-as-item: xexpr -> xexpr
+; Consumes an xexpr, and produces a rendering
+; as a list item.
+(define (render-as-item a-fragment)
+  `(li ,a-fragment))
+	这种持久化方法对于简单的应用程序可以工作得非常好。 但是随着应用程序需求的增长，我们将必须处理并发问题，在我们的数据模型上缺少一个简单的查询语言等。因此，在下一节中，我们将解释如何使用SQL数据库来存储我们的 博客模型。
+
+15使用SQL数据库
+	要使用SQL数据库，我们使用以下来自db库的绑定：connection?，sqlite3-connect，table-exists?，query-exec，query-list和query-value。通过将以下内容添加到模型顶部来导入它们：
+     (require db)
+	接下来，我们使用以下表格为我们的模型定义关系结构：
+CREATE TABLE posts (id INTEGER PRIMARY KEY, title TEXT, body TEXT)
+CREATE TABLE comments (pid INTEGER, content TEXT)
+	像Racket结构一样，数据库中的一个帖子有一个标题和一个主体，但它也有一个标识符。 （实际上，Racket结构也有一个标识符——内存指针——但是数据库要求它是显式的。）
+	对于评论，每个有一些文本内容，并通过标识符连接到一个帖子。我们可以选择使用write来序列化注释，并在posts表中添加一个新的TEXT列来存储值。但是单独的注释表能更好地符合关系风格。
+	博客结构现在只是一个数据库句柄的容器：
+ (struct blog (db))
+  db : connection?
+练习：
+	编写博客结构定义。 它不需要是可变的或可序列化的。我们现在可以编写代码来初始化一个博客结构：
+; initialize-blog! : path? -> blog?
+; Sets up a blog database (if it doesn't exist)
+(define (initialize-blog! home)
+  (define db (sqlite3-connect #:database home #:mode 'create))
+  (define the-blog (blog db))
+  (unless (table-exists? db "posts")
+    (query-exec db
+     (string-append
+      "CREATE TABLE posts "
+      "(id INTEGER PRIMARY KEY, title TEXT, body TEXT)"))
+    (blog-insert-post!
+     the-blog "First Post" "This is my first post")
+    (blog-insert-post!
+     the-blog "Second Post" "This is another post"))
+  (unless (table-exists? db "comments")
+    (query-exec db
+     "CREATE TABLE comments (pid INTEGER, content TEXT)")
+    (post-insert-comment!
+     the-blog (first (blog-posts the-blog))
+     "First comment!"))
+  the-blog)
+	给定“create”标志，如果在主路径中不存在数据库，sqlite3-connect创建一个数据库。
+	我们仍然需要使用表定义和初始数据初始化数据库。 
+	以前我们使用blog-insert-post! 和插入注释！ 以此目的; 这里是他们的新实现：
+; blog-insert-post!: blog? string? string? -> void
+; Consumes a blog and a post, adds the post at the top of the blog.
+(define (blog-insert-post! a-blog title body)
+  (query-exec
+   (blog-db a-blog)
+   "INSERT INTO posts (title, body) VALUES (?, ?)"
+   title body))
+ 
+; post-insert-comment!: blog? post string -> void
+; Consumes a blog, a post and a comment string.  As a side-effect,
+; adds the comment to the bottom of the post's list of comments.
+(define (post-insert-comment! a-blog p a-comment)
+  (query-exec
+   (blog-db a-blog)
+   "INSERT INTO comments (pid, content) VALUES (?, ?)"
+   (post-id p) a-comment))
+	注意，上面的SQL查询使用SQL占位符？来执行字符串替换。 如果他们使用格式和〜a来执行它，恶意用户可以提交一个 title like "null', 'null') and INSERT INTO accounts (username,\npassword) VALUES ('ur','hacked" 并获得query-exec来创建两个INSERT而不是一个INSERT，这被称为SQL注入攻击。
+	SQL占位符通过确保查询按照原样提交给SQLite来防止这种攻击，SQLite然后解析它并应用参数。 此方法确保将参数严格地视为数据。
+
+	在post-insert-comment! 我们使用post-id，但是我们还没有定义新的post结构。 由于post表模式使用一个整数作为标识符，它对post结构来说也是足够的。 然而，如此定义的结构将不指示帖子属于哪个博客，并且因此不指示帖子属于哪个数据库。
+	因此，我们无法提取标题或正文值。解决方案，当然是将博客与每个帖子关联：
+	struct
+        (struct post (blog id))
+      blog : blog?
+      id : integer?
+练习：
+	写帖子的结构定义。
+	创建帖子的唯一功能是blog-posts：
+; blog-posts : blog -> (listof post?)
+; Queries for the post ids
+(define (blog-posts a-blog)
+  (define (id->post an-id)
+    (post a-blog an-id))
+  (map id->post
+       (query-list
+        (blog-db a-blog)
+        "SELECT id FROM posts")))
+	query-list可用于返回单个列的查询（例如，“SELECT id FROM posts”），并返回该列的值的列表。
+	在这一点上，我们可以编写对帖子操作的函数：
+; post-title : post -> string?
+; Queries for the title
+(define (post-title a-post)
+  (query-value
+   (blog-db (post-blog a-post))
+   "SELECT title FROM posts WHERE id = ?"
+   (post-id a-post)))
+query-value用于返回单个值（即，一行和一列）的查询。行使。 写post体的定义。
+练习：
+	写下注释的定义。 （提示：使用博客帖子作为模板，而不是帖子。）
+
+我们需要对应用程序进行的唯一更改是需要新模型。 注意它的接口保持不变！
+
+我们的模型是：
+    #lang racket/base
+    (require racket/list
+             db)
+     
+    ; A blog is a (blog db)
+    ; where db is an sqlite connection
+    (struct blog (db))
+     
+    ; A post is a (post blog id)
+    ; where blog is a blog and id is an integer?
+    (struct post (blog id))
+     
+    ; initialize-blog! : path? -> blog?
+    ; Sets up a blog database (if it doesn't exist)
+    (define (initialize-blog! home)
+      (define db (sqlite3-connect #:database home #:mode 'create))
+      (define the-blog (blog db))
+      (unless (table-exists? db "posts")
+        (query-exec db
+         (string-append
+          "CREATE TABLE posts "
+          "(id INTEGER PRIMARY KEY, title TEXT, body TEXT)"))
+        (blog-insert-post!
+         the-blog "First Post" "This is my first post")
+        (blog-insert-post!
+         the-blog "Second Post" "This is another post"))
+      (unless (table-exists? db "comments")
+        (query-exec db
+         "CREATE TABLE comments (pid INTEGER, content TEXT)")
+        (post-insert-comment!
+         the-blog (first (blog-posts the-blog))
+         "First comment!"))
+      the-blog)
+     
+    ; blog-posts : blog -> (listof post?)
+    ; Queries for the post ids
+    (define (blog-posts a-blog)
+      (define (id->post an-id)
+        (post a-blog an-id))
+      (map id->post
+           (query-list
+            (blog-db a-blog)
+            "SELECT id FROM posts")))
+     
+    ; post-title : post -> string?
+    ; Queries for the title
+    (define (post-title a-post)
+      (query-value
+       (blog-db (post-blog a-post))
+       "SELECT title FROM posts WHERE id = ?"
+       (post-id a-post)))
+     
+    ; post-body : post -> string?
+    ; Queries for the body
+    (define (post-body p)
+      (query-value
+       (blog-db (post-blog p))
+       "SELECT body FROM posts WHERE id = ?"
+       (post-id p)))
+     
+    ; post-comments : post -> (listof string?)
+    ; Queries for the comments
+    (define (post-comments p)
+      (query-list
+       (blog-db (post-blog p))
+       "SELECT content FROM comments WHERE pid = ?"
+       (post-id p)))
+     
+    ; blog-insert-post!: blog? string? string? -> void
+    ; Consumes a blog and a post, adds the post at the top of the blog.
+    (define (blog-insert-post! a-blog title body)
+      (query-exec
+       (blog-db a-blog)
+       "INSERT INTO posts (title, body) VALUES (?, ?)"
+       title body))
+     
+    ; post-insert-comment!: blog? post string -> void
+    ; Consumes a blog, a post and a comment string.  As a side-efect, 
+    ; adds the comment to the bottom of the post's list of comments.
+    (define (post-insert-comment! a-blog p a-comment)
+      (query-exec
+       (blog-db a-blog)
+       "INSERT INTO comments (pid, content) VALUES (?, ?)"
+       (post-id p) a-comment))
+     
+    (provide blog? blog-posts
+             post? post-title post-body post-comments
+             initialize-blog!
+             blog-insert-post! post-insert-comment!)
+我们的应用是：
+     #lang web-server / insta
+     
+     （require“model-3.rkt”）
+     
+     ....
+有关编写支持数据库的Web servlet的更多信息，请参阅数据库和Web Servlet。
+
+16使用Formlet
+	现在让我们回到应用程序代码。 我们糟糕的设计选择之一是在渲染代码中用于标识表单元素的名称与在提取代码中使用的名称之间建立了松散的连接：
+; render-blog-page: blog request -> doesnt'
+; Send an HTML page of the content of the
+; blog.
+(define (render-blog-page a-blog request)
+  (define (response-generator embed/url)
+    (response/xexpr
+     `(html (head (title "My Blog"))
+            (body
+             (h1 "My Blog")
+             ,(render-posts a-blog embed/url)
+             (form ((action
+                     ,(embed/url insert-post-handler)))
+                   ; "title" is used here
+                   (input ((name "title")))
+                   (input ((name "body")))
+                   (input ((type "submit"))))))))
+ 
+  (define (insert-post-handler request)
+    (define bindings (request-bindings request))
+    (blog-insert-post!
+     a-blog
+     ; And "title" is used here.
+     (extract-binding/single 'title bindings)
+     (extract-binding/single 'body bindings))
+    (render-blog-page a-blog (redirect/get)))
+  (send/suspend/dispatch response-generator))
+	Racket Web框架提供了formlets来抽象这些名称，通过在HTML中自动调整这些名称，以及通过提供以下界面来显示和处理表单： 
+	formlet显示获取一个formlet，并以X表达式列表的形式返回它的呈现。 这将为其表单元素生成唯一的名称。
+	 formlet过程获取一个formlet和一个请求并处理formlet，即使用通过formlet显示生成的名称从请求中提取绑定。使用formlet语法创建formlet。 例如，下面是一个render-blog-page的formlet：
+; new-post-formlet : formlet (values string? string?)
+; A formlet for requesting a title and body of a post
+(define new-post-formlet
+  (formlet
+   (#%# ,{input-string . => . title}
+        ,{input-string . => . body})
+   (values title body)))
+	formlet语法中的第一个参数决定了formlet显示应该如何显示formlet。它是一个引用的X表达式，有两个重要的区别：
+    	＃％＃引入了X表达式的列表  ,{=> formlet id}将formlet formlet嵌入为子表单，并将名称id附加到处理此子表单的结果。
+
+	例如，input-string本身是一个产生一个字符串的库格式，并且{=> input-string title}在new-post-formlet中嵌入input-string，并将名称标题与该字符串相关联。
+	输入字符串呈现为 `(input ([type "text"] [name ,fresh_name]))，所以 (formlet-display new-post-formlet)渲染为：
+       (list '(input ([type "text"] [name "input_0"]))
+            '(input ([type "text"] [name "input_1"])))
+	formlet的第二个参数决定了formlet-process如何处理formlet。也就是说，它指定如何对处理小平面子表单的结果进行分组和排序：右边的标识符=>被绑定到处理子表单的结果。
+	例如，input-string被处理为 (extract-binding/single fresh_name (request-bindings request))。因此，如果请求将“input_0”绑定到“Title”并将“input_1”绑定到“Body”，则 (formlet-process new-post-formlet request) 返回 (values "Title" "Body")。
+	最后，这里是如何在render-blog-page中使用new-post-formlet：
+; render-blog-page: blog request -> doesn't return
+; Sends an HTML page of the content of the
+; blog.
+(define (render-blog-page a-blog request)
+  (define (response-generator embed/url)
+    (response/xexpr
+     `(html (head (title "My Blog"))
+            (body
+             (h1 "My Blog")
+             ,(render-posts a-blog embed/url)
+             (form ([action
+                     ,(embed/url insert-post-handler)])
+                   ,@(formlet-display new-post-formlet)
+                   (input ([type "submit"])))))))
+ 
+  (define (insert-post-handler request)
+    (define-values (title body)
+      (formlet-process new-post-formlet request))
+    (blog-insert-post! a-blog title body)
+    (render-blog-page a-blog (redirect/get)))
+  (send/suspend/dispatch response-generator))
+	替代方式：上面显示的formlet使用了输入字符串组合器，它将一堆其他formlet组合成一个带有默认值的容器。 有时它是有用的，拆分，以提供不同的参数的子件。 例如，假设我们要向表单元素添加一个CSS类？ 下面是我们如何做：
+(define new-post-formlet
+  (formlet
+   (#%# ,((to-string
+           (required
+            (text-input
+             #:attributes '([class "form-text"]))))
+          . => . title)
+        ,((to-string
+           (required
+            (text-input
+             #:attributes '([class "form-text"]))))
+          . => . body))
+   (values title body)))
+练习：
+	编写一个格式，并在render-post-detail-page中使用它。
+
+	我们的应用程序现在是：
+#lang web-server/insta
+ 
+(require web-server/formlets
+         "model-3.rkt")
+ 
+; start: request -> doesn't return
+; Consumes a request and produces a page that displays
+; all of the web content.
+(define (start request)
+  (render-blog-page
+   (initialize-blog!
+    (build-path (current-directory)
+                "the-blog-data.sqlite"))
+   request))
+ 
+; new-post-formlet : formlet (values string? string?)
+; A formlet for requesting a title and body of a post
+(define new-post-formlet
+  (formlet
+   (#%# ,{input-string . => . title}
+        ,{input-string . => . body})
+   (values title body)))
+ 
+; render-blog-page: blog request -> doesn't return
+; Produces an HTML page of the content of the
+; blog.
+(define (render-blog-page a-blog request)
+  (define (response-generator embed/url)
+    (response/xexpr
+     `(html (head (title "My Blog"))
+            (body
+             (h1 "My Blog")
+             ,(render-posts a-blog embed/url)
+             (form ([action
+                     ,(embed/url insert-post-handler)])
+                   ,@(formlet-display new-post-formlet)
+                   (input ([type "submit"])))))))
+ 
+  (define (insert-post-handler request)
+    (define-values (title body)
+      (formlet-process new-post-formlet request))
+    (blog-insert-post! a-blog title body)
+    (render-blog-page a-blog (redirect/get)))
+  (send/suspend/dispatch response-generator))
+ 
+; new-comment-formlet : formlet string
+; A formlet for requesting a comment
+(define new-comment-formlet
+  input-string)
+ 
+; render-post-detail-page: post request -> doesn't return
+; Consumes a post and produces a detail page of the post.
+; The user will be able to either insert new comments
+; or go back to render-blog-page.
+(define (render-post-detail-page a-blog a-post request)
+  (define (response-generator embed/url)
+    (response/xexpr
+     `(html (head (title "Post Details"))
+            (body
+             (h1 "Post Details")
+             (h2 ,(post-title a-post))
+             (p ,(post-body a-post))
+             ,(render-as-itemized-list
+               (post-comments a-post))
+             (form ([action
+                     ,(embed/url insert-comment-handler)])
+                   ,@(formlet-display new-comment-formlet)
+                   (input ([type "submit"])))
+             (a ([href ,(embed/url back-handler)])
+                "Back to the blog")))))
+ 
+  (define (insert-comment-handler request)
+    (render-confirm-add-comment-page
+     a-blog
+     (formlet-process new-comment-formlet request)
+     a-post
+     request))
+ 
+  (define (back-handler request)
+    (render-blog-page a-blog request))
+  (send/suspend/dispatch response-generator))
+ 
+; render-confirm-add-comment-page :
+; blog comment post request -> doesn't return
+; Consumes a comment that we intend to add to a post, as well
+; as the request. If the user follows through, adds a comment 
+; and goes back to the display page. Otherwise, goes back to 
+; the detail page of the post.
+(define (render-confirm-add-comment-page a-blog a-comment
+                                         a-post request)
+  (define (response-generator embed/url)
+    (response/xexpr
+     `(html (head (title "Add a Comment"))
+            (body
+             (h1 "Add a Comment")
+             "The comment: " (div (p ,a-comment))
+             "will be added to "
+             (div ,(post-title a-post))
+ 
+             (p (a ([href ,(embed/url yes-handler)])
+                   "Yes, add the comment."))
+             (p (a ([href ,(embed/url cancel-handler)])
+                   "No, I changed my mind!"))))))
+ 
+  (define (yes-handler request)
+    (post-insert-comment! a-blog a-post a-comment)
+    (render-post-detail-page a-blog a-post (redirect/get)))
+ 
+  (define (cancel-handler request)
+    (render-post-detail-page a-blog a-post request))
+  (send/suspend/dispatch response-generator))
+ 
+; render-post: post (handler -> string) -> xexpr
+; Consumes a post, produces an xexpr fragment of the post.
+; The fragment contains a link to show a detailed view of the post.
+(define (render-post a-blog a-post embed/url)
+  (define (view-post-handler request)
+    (render-post-detail-page a-blog a-post request))
+  `(div ([class "post"])
+        (a ([href ,(embed/url view-post-handler)])
+           ,(post-title a-post))
+        (p ,(post-body a-post))
+        (div ,(number->string (length (post-comments a-post)))
+             " comment(s)")))
+ 
+; render-posts: blog (handler -> string) -> xexpr
+; Consumes a embed/url, produces an xexpr fragment
+; of all its posts.
+(define (render-posts a-blog embed/url)
+  (define (render-post/embed/url a-post)
+    (render-post a-blog a-post embed/url))
+  `(div ([class "posts"])
+        ,@(map render-post/embed/url (blog-posts a-blog))))
+ 
+; render-as-itemized-list: (listof xexpr) -> xexpr
+; Consumes a list of items, and produces a rendering as
+; an unorderered list.
+(define (render-as-itemized-list fragments)
+  `(ul ,@(map render-as-item fragments)))
+ 
+; render-as-item: xexpr -> xexpr
+; Consumes an xexpr, and produces a rendering
+; as a list item.
+(define (render-as-item a-fragment)
+  `(li ,a-fragment))
+
+17离开DrRacket
+	我们习惯按下Run按钮在DrRacket中运行我们的应用程序。 但是，如果我们实际部署一个应用程序，我们需要通过一种不同的方法启动它。
+	最简单的选择是使用web-server / servlet-env。 首先，更改应用程序中的第一行 
+#lang web-server / insta
+为
+ #lang racket
+   
+    (require web-server/servlet)
+    (provide/contract (start (request? . -> . response?)))
+第二，在应用程序的底部添加以下内容：
+(require web-server/servlet-env)
+(serve/servlet start
+               #:launch-browser? #f
+               #:quit? #f
+               #:listen-ip #f
+               #:port 8000
+               #:extra-files-paths
+               (list (build-path your-path-here "htdocs"))
+               #:servlet-path
+               "/servlets/APPLICATION.rkt")
+关于serve / servlet的参数：
+	您可以更改#:port参数的值以使用其他端口。 
+ 	#:listen-ip设置为#f，以便服务器将侦听所有可用的IP。
+	您应该将your-path-here更改为您的htdocs目录的父目录的路径。
+	您应该将“APPLICATION.rkt”更改为您的应用程序的名称。
+	第三，要运行服务器，您可以按DrRacket中的运行，或键入
+racket -t <file.rkt>
+（使用你自己的文件名，当然）。 这两个都将为您的应用程序启动一个Web服务器。 您的应用程序将在http：// localhost：8000 / servlets / APPLICATION.rkt上可用。
+
+	serve/servlet需要其他参数，还有更高级的启动Web服务器的方法，但是您必须参考Racket Web Server参考手册了解详细信息。
+
+18使用HTTPS
+	最后，这里是在HTTPS模式下使用服务器的说明。 这需要SSL证书和私钥。 它也非常针对特定平台，但是这里是在UNIX上使用OpenSSL的详细信息： 
+	openssl genrsa -des3 -out private-key.pem 1024
+	这将生成一个新的私钥，但带有密码，您可以删除如下：
+ 	openssl rsa -in private-key.pem -out private-key.pem chmod 400 private-key.pem
+	现在我们生成一个自签名证书：
+ openssl req -new -x509 -nodes -sha1 -days 365 -key private-key.pem> server-cert.pem
+（每个证书颁发机构都有不同的生成证书签名请求的方式。）
+	我们现在可以启动服务器：
+ 	plt-web-server --sslWeb
+	服务器将使用我们创建的“private-key.pem”和“server-cert.pem”在端口443（可以使用-p选项覆盖）上启动。
+
+19提升
+	随着您使用自己的应用程序，您可能会发现许多其他包有用。 有与其他数据库的接口，许多工具用于生成HTML，XML，JavaScript等的输出。有关注册包的列表，请参阅
+https://pkgs.racket-lang.org/。
+	在Racket邮件列表上还有一个活跃的用户社区。 我们欢迎新用户！
